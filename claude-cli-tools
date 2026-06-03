@@ -1,0 +1,460 @@
+#!/bin/bash
+# claude-cli-tools
+# Claude Code install, backup, and restore for Linux (and macOS).
+#
+# Backs up ~/.claude/ using rsync --link-dest incremental snapshots.
+# Each hourly run creates a dated snapshot directory. Unchanged files are
+# hardlinks to the previous snapshot — zero extra disk space. Snapshots
+# land in ~/development/claude/snapshots/, which restic already covers.
+#
+# Usage:
+#   claude-cli-tools --install    [--no-auto-restore]   Install Claude + cl wrapper + setup
+#   claude-cli-tools --setup                            Deploy audit hooks, install hourly cron
+#   claude-cli-tools --backup                           Trim old conversations, create snapshot
+#   claude-cli-tools --restore    [snapshot-dir] [--force]  Restore snapshot → ~/.claude/
+#   claude-cli-tools --status                           Show snapshot info, sync state
+#   claude-cli-tools --help
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SNAPSHOT_DIR_ROOT="${CLAUDE_SNAPSHOTS:-$HOME/development/claude/snapshots}"
+CLAUDE_LIVE="$HOME/.claude"
+MAX_SNAPSHOTS=336              # 14 days × 24 hourly runs
+CONVERSATION_HISTORY_DAYS=14
+FORCE=0
+NO_AUTO_RESTORE=0
+MODE=""
+SNAPSHOT=""
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+usage() {
+    cat <<'EOF'
+claude-cli-tools — Claude Code install, backup, and restore for Linux
+
+Usage:
+  claude-cli-tools --install    [--no-auto-restore]
+      Install Claude (native installer), deploy the cl tmux wrapper to
+      ~/.local/bin/cl, and run --setup. If snapshots exist, auto-restores
+      the latest one. Pass --no-auto-restore to skip.
+
+  claude-cli-tools --setup
+      Deploy audit hooks into ~/.claude/settings.json and install an
+      hourly cron job for --backup. Safe to re-run (idempotent).
+
+  claude-cli-tools --backup
+      Trim .jsonl sessions older than 14 days from ~/.claude/projects/,
+      then create an incremental rsync snapshot under SNAPSHOT_DIR_ROOT.
+
+  claude-cli-tools --restore [snapshot-dir] [--force]
+      Restore the latest snapshot (or a named one) into ~/.claude/.
+      Safety checks: source must be non-empty and >= 50% of dest size.
+      --force overrides the size check (not the empty check).
+
+  claude-cli-tools --status
+      Show snapshot count, latest snapshot date, disk usage, and
+      whether ~/.claude/ looks in sync with the latest snapshot.
+
+  claude-cli-tools --help
+
+Environment:
+  CLAUDE_SNAPSHOTS   Override snapshot directory (default: ~/development/claude/snapshots)
+
+Backup model (rsync --link-dest incremental):
+  Each --backup creates SNAPSHOT_DIR_ROOT/snapshot-YYYYMMDDTHHMMSS/
+  Unchanged files are hardlinks to the prior snapshot — zero extra space.
+  Conversation history older than CONVERSATION_HISTORY_DAYS is trimmed from live
+  before each snapshot. MAX_SNAPSHOTS oldest dirs are deleted automatically.
+  --restore creates a live-YYYYMMDDTHHMMSS.tar.gz pre-restore safety snapshot.
+EOF
+}
+
+file_size() { [ -f "$1" ] && stat -c '%s' "$1" 2>/dev/null || echo "0"; }
+file_mtime() { [ -e "$1" ] && stat -c '%Y' "$1" 2>/dev/null || echo "0"; }
+file_date()  { [ -e "$1" ] && stat -c '%y' "$1" 2>/dev/null | cut -c1-16 || echo "—"; }
+
+# ── Conversation history trim ─────────────────────────────────────────────────
+
+trim_old_conversations() {
+    [ -d "$CLAUDE_LIVE/projects" ] || return
+    local count
+    count=$(find "$CLAUDE_LIVE/projects" -name "*.jsonl" -mtime "+$CONVERSATION_HISTORY_DAYS" \
+        -print -delete 2>/dev/null | wc -l | tr -d ' ')
+    [ "$count" -gt 0 ] && echo "  Trimmed $count conversation file(s) older than ${CONVERSATION_HISTORY_DAYS}d"
+}
+
+# ── Pre-restore safety snapshot ───────────────────────────────────────────────
+
+snapshot_live_files() {
+    [ -d "$CLAUDE_LIVE" ] || return
+    local ts archive
+    ts=$(date +%Y%m%dT%H%M%S)
+    archive="$SNAPSHOT_DIR_ROOT/../live-${ts}.tar.gz"
+    mkdir -p "$(dirname "$archive")"
+    tar -czf "$archive" -C "$HOME" .claude 2>/dev/null \
+        && echo "  Pre-restore snapshot    → live-${ts}.tar.gz" \
+        || echo "  WARNING: pre-restore snapshot failed"
+}
+
+# ── Incremental snapshot ──────────────────────────────────────────────────────
+
+create_snapshot() {
+    local ts prev snapshot_dir
+    prev=$(ls -td "$SNAPSHOT_DIR_ROOT"/snapshot-* 2>/dev/null | head -1)
+    ts=$(date +%Y%m%dT%H%M%S)
+    snapshot_dir="$SNAPSHOT_DIR_ROOT/snapshot-${ts}"
+    mkdir -p "$snapshot_dir"
+
+    if [ -n "$prev" ]; then
+        rsync -a --link-dest="$prev" "$CLAUDE_LIVE/" "$snapshot_dir/" 2>/dev/null \
+            && echo "  Snapshot (incremental)  → snapshot-${ts}" \
+            || echo "  WARNING: incremental snapshot failed"
+    else
+        rsync -a "$CLAUDE_LIVE/" "$snapshot_dir/" 2>/dev/null \
+            && echo "  Snapshot (full)         → snapshot-${ts}" \
+            || echo "  WARNING: snapshot failed"
+    fi
+}
+
+# ── Snapshot rotation ─────────────────────────────────────────────────────────
+
+rotate_snapshots() {
+    local excess
+    excess=$(ls -td "$SNAPSHOT_DIR_ROOT"/snapshot-* 2>/dev/null | tail -n +$((MAX_SNAPSHOTS + 1)))
+    [ -n "$excess" ] && echo "$excess" | xargs rm -rf \
+        && echo "  Rotated old snapshots (kept $MAX_SNAPSHOTS)"
+
+    excess=$(ls -t "$(dirname "$SNAPSHOT_DIR_ROOT")"/live-*.tar.gz 2>/dev/null | tail -n +$((MAX_SNAPSHOTS + 1)))
+    [ -n "$excess" ] && echo "$excess" | xargs rm -f \
+        && echo "  Rotated old pre-restore snapshots"
+}
+
+# ── Safety check ──────────────────────────────────────────────────────────────
+
+check_source_safe() {
+    local src="$1" dest="$2" label="$3"
+    local src_count dest_count pct
+
+    if [ ! -d "$src" ]; then
+        echo "ERROR: snapshot source not found: $src" >&2
+        return 1
+    fi
+
+    src_count=$(find "$src" -type f | wc -l | tr -d ' ')
+    if [ "$src_count" -eq 0 ]; then
+        echo "ERROR: snapshot source is empty: $src" >&2
+        return 1
+    fi
+
+    [ ! -d "$dest" ] && return 0
+
+    dest_count=$(find "$dest" -type f | wc -l | tr -d ' ')
+    [ "$dest_count" -eq 0 ] && return 0
+
+    if [ "$src_count" -lt "$((dest_count / 2))" ]; then
+        pct=$((src_count * 100 / dest_count))
+        if [ "$FORCE" -eq 1 ]; then
+            echo "  WARN  source has $src_count files (${pct}% of live $dest_count) (--force override)"
+            return 0
+        fi
+        echo "ERROR: source has $src_count files (${pct}% of live $dest_count) — looks incomplete. Use --force to override." >&2
+        return 1
+    fi
+    return 0
+}
+
+# ── --status ──────────────────────────────────────────────────────────────────
+
+do_status() {
+    local n_snapshots latest_snapshot snap_size snap_ts live_count snap_count
+    n_snapshots=$(ls -d "$SNAPSHOT_DIR_ROOT"/snapshot-* 2>/dev/null | wc -l | tr -d ' ')
+    latest_snapshot=$(ls -td "$SNAPSHOT_DIR_ROOT"/snapshot-* 2>/dev/null | head -1)
+    snap_size=$(du -sh "$SNAPSHOT_DIR_ROOT" 2>/dev/null | cut -f1)
+    live_count=$(find "$CLAUDE_LIVE" -type f 2>/dev/null | wc -l | tr -d ' ')
+
+    echo ""
+    echo "=== claude-cli-tools status ==="
+    echo ""
+    echo "  Live:        $CLAUDE_LIVE ($live_count files)"
+    echo "  Snapshots:   $SNAPSHOT_DIR_ROOT"
+    if [ -n "$latest_snapshot" ]; then
+        snap_ts=$(basename "$latest_snapshot" | sed 's/snapshot-//')
+        snap_count=$(find "$latest_snapshot" -type f 2>/dev/null | wc -l | tr -d ' ')
+        echo "  Latest:      ${snap_ts:0:4}-${snap_ts:4:2}-${snap_ts:6:2} ${snap_ts:9:2}:${snap_ts:11:2}  ($snap_count files)"
+        echo "  Count:       $n_snapshots snapshots  (max $MAX_SNAPSHOTS)  ${snap_size:-?} total"
+
+        if [ "$live_count" -gt 0 ] && [ "$snap_count" -lt "$((live_count / 2))" ]; then
+            echo "  Sync:        BACKUP RECOMMENDED (snapshot ${snap_count} vs live ${live_count} files)"
+        else
+            echo "  Sync:        ✓ in sync"
+        fi
+    else
+        echo "  Latest:      none yet — run --backup to create first snapshot"
+    fi
+
+    echo ""
+    local cron_line
+    cron_line=$(crontab -l 2>/dev/null | grep "claude-cli-tools --backup")
+    if [ -n "$cron_line" ]; then
+        echo "  Cron:        ✓ hourly backup active"
+    else
+        echo "  Cron:        not installed — run --setup to add"
+    fi
+
+    local hook_state
+    if [ -f "$CLAUDE_LIVE/settings.json" ] && grep -q '"PreToolUse"' "$CLAUDE_LIVE/settings.json" 2>/dev/null; then
+        echo "  Hooks:       ✓ audit hooks installed"
+    else
+        echo "  Hooks:       not installed — run --setup to add"
+    fi
+
+    echo ""
+}
+
+# ── --backup ──────────────────────────────────────────────────────────────────
+
+do_backup() {
+    echo ""
+    echo "=== Backing up ~/.claude/ → incremental snapshot ==="
+    echo ""
+    mkdir -p "$SNAPSHOT_DIR_ROOT"
+    trim_old_conversations
+    create_snapshot
+    rotate_snapshots
+    echo ""
+    echo "=== Backup complete ==="
+    echo ""
+}
+
+# ── --restore ─────────────────────────────────────────────────────────────────
+
+do_restore() {
+    local snap_src
+    snap_src="$SNAPSHOT"
+    [ -z "$snap_src" ] && snap_src=$(ls -td "$SNAPSHOT_DIR_ROOT"/snapshot-* 2>/dev/null | head -1)
+
+    if [ -z "$snap_src" ] || [ ! -d "$snap_src" ]; then
+        echo "ERROR: No snapshots found in $SNAPSHOT_DIR_ROOT. Run --backup first." >&2
+        exit 1
+    fi
+
+    echo ""
+    echo "=== Restoring from $(basename "$snap_src") → ~/.claude/ ==="
+    echo ""
+
+    check_source_safe "$snap_src" "$CLAUDE_LIVE" "snapshot" || exit 1
+
+    snapshot_live_files
+    mkdir -p "$CLAUDE_LIVE"
+    echo ""
+
+    rsync -a "$snap_src/" "$CLAUDE_LIVE/" 2>/dev/null \
+        && echo "  ✓  ~/.claude/ restored via rsync" \
+        || { echo "ERROR: rsync restore failed" >&2; exit 1; }
+
+    echo ""
+    echo "=== Restore complete. Restart Claude Code if it's running. ==="
+    echo ""
+    rotate_snapshots
+}
+
+# ── --setup ───────────────────────────────────────────────────────────────────
+
+do_setup() {
+    echo ""
+    echo "=== Setting up claude-cli-tools ==="
+    echo ""
+
+    # Snapshot directory
+    mkdir -p "$SNAPSHOT_DIR_ROOT"
+    echo "  ✓  Snapshot dir: $SNAPSHOT_DIR_ROOT"
+
+    # Audit hooks
+    local settings="$CLAUDE_LIVE/settings.json"
+    local pre_hook="$SCRIPT_DIR/hooks/pre-bash.sh"
+    local post_hook="$SCRIPT_DIR/hooks/post-bash.sh"
+
+    mkdir -p "$SCRIPT_DIR/data"
+    chmod +x "$pre_hook" "$post_hook" 2>/dev/null
+
+    if [ -f "$settings" ] && grep -q '"PreToolUse"' "$settings" 2>/dev/null; then
+        echo "  ✓  Audit hooks already in settings.json"
+    elif [ ! -f "$settings" ] || [ ! -s "$settings" ]; then
+        mkdir -p "$CLAUDE_LIVE"
+        cat > "$settings" <<EOF
+{
+  "hooks": {
+    "PreToolUse": [
+      {"matcher": "Bash", "hooks": [{"type": "command", "command": "$pre_hook"}]}
+    ],
+    "PostToolUse": [
+      {"matcher": "Bash", "hooks": [{"type": "command", "command": "$post_hook"}]}
+    ]
+  }
+}
+EOF
+        echo "  ✓  Audit hooks written to settings.json"
+    else
+        # Merge hooks into existing settings.json via python3 (safe, no jq dependency)
+        python3 - "$settings" "$pre_hook" "$post_hook" <<'PYEOF'
+import json, sys
+path, pre, post = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path) as f:
+    data = json.load(f)
+data['hooks'] = {
+    'PreToolUse':  [{'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': pre}]}],
+    'PostToolUse': [{'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': post}]}]
+}
+with open(path, 'w') as f:
+    json.dump(data, f, indent=2)
+    f.write('\n')
+PYEOF
+        echo "  ✓  Audit hooks merged into settings.json"
+    fi
+
+    # Hourly cron
+    local cron_entry="0 * * * * $SCRIPT_DIR/claude-cli-tools --backup"
+    if crontab -l 2>/dev/null | grep -q "claude-cli-tools --backup"; then
+        echo "  ✓  Hourly backup cron already installed"
+    else
+        (crontab -l 2>/dev/null | grep -v "claude-cli-tools --backup"; echo "$cron_entry") | crontab -
+        echo "  ✓  Hourly backup cron installed"
+    fi
+
+    echo ""
+    echo "=== Setup complete ==="
+    echo ""
+}
+
+# ── --install ─────────────────────────────────────────────────────────────────
+
+do_install() {
+    echo ""
+    echo "=== Installing Claude Code ==="
+    echo ""
+
+    # Native installer
+    echo "  Running Claude native installer..."
+    curl -fsSL https://claude.ai/install.sh | bash
+    echo ""
+
+    # cl tmux wrapper → ~/.local/bin/cl
+    echo "  Deploying cl tmux wrapper → ~/.local/bin/cl..."
+    mkdir -p "$HOME/.local/bin"
+    cat > "$HOME/.local/bin/cl" <<'CLEOF'
+#!/bin/bash
+# Wrapper around claude: sets tmux window name from session name.
+# Polls ~/.claude/sessions/<pid>.json after launch; renames the tmux
+# window to the session name and tracks changes while the session runs.
+
+MY_PID=$$
+SESSION_FILE="$HOME/.claude/sessions/${MY_PID}.json"
+WINDOWS_DIR="$HOME/.claude_windows"
+mkdir -p "$WINDOWS_DIR"
+
+if [ -n "$TMUX" ]; then
+    WINDOW_ID=$(tmux display-message -p '#{window_id}')
+
+    (
+        for i in $(seq 1 20); do
+            sleep 0.5
+            [ -f "$SESSION_FILE" ] && break
+        done
+        [ -f "$SESSION_FILE" ] || exit 0
+
+        SESSION_ID=$(python3 -c "import json; d=json.load(open('$SESSION_FILE')); print(d['sessionId'])")
+        NAME=$(python3 -c "import json; d=json.load(open('$SESSION_FILE')); print(d.get('name') or d['cwd'].split('/')[-1])")
+
+        echo "$SESSION_ID" > "$WINDOWS_DIR/$WINDOW_ID"
+        CURRENT_NAME="$NAME"
+        tmux rename-window -t "$WINDOW_ID" "$NAME"
+
+        while [ -f "$SESSION_FILE" ]; do
+            sleep 3
+            NEW_NAME=$(python3 -c "import json; d=json.load(open('$SESSION_FILE')); print(d.get('name') or d['cwd'].split('/')[-1])" 2>/dev/null)
+            if [ -n "$NEW_NAME" ] && [ "$NEW_NAME" != "$CURRENT_NAME" ]; then
+                tmux rename-window -t "$WINDOW_ID" "$NEW_NAME"
+                CURRENT_NAME="$NEW_NAME"
+            fi
+        done
+
+        rm -f "$WINDOWS_DIR/$WINDOW_ID"
+    ) &
+fi
+
+# Use absolute path — cl may be invoked before ~/.local/bin is in PATH
+CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
+exec "$CLAUDE_BIN" "$@"
+CLEOF
+    chmod +x "$HOME/.local/bin/cl"
+    echo "  ✓  cl → ~/.local/bin/cl"
+
+    # Ensure ~/.local/bin is in PATH
+    if ! echo "$PATH" | grep -q "$HOME/.local/bin"; then
+        echo "  NOTE: Add ~/.local/bin to your PATH (it's not there now)."
+        echo "        Add to ~/.bashrc:  export PATH=\"\$HOME/.local/bin:\$PATH\""
+    fi
+
+    echo ""
+    do_setup
+
+    # Auto-restore if snapshots exist
+    local latest_snap
+    latest_snap=$(ls -td "$SNAPSHOT_DIR_ROOT"/snapshot-* 2>/dev/null | head -1)
+    if [ -n "$latest_snap" ]; then
+        if [ "$NO_AUTO_RESTORE" -eq 1 ]; then
+            echo "  Snapshots found but --no-auto-restore set — skipping restore."
+            echo "  Run --restore when ready."
+            echo ""
+        else
+            local snap_ts
+            snap_ts=$(basename "$latest_snap" | sed 's/snapshot-//')
+            echo "  Snapshots found (latest: ${snap_ts:0:4}-${snap_ts:4:2}-${snap_ts:6:2} ${snap_ts:9:2}:${snap_ts:11:2})"
+            echo "  Auto-restoring to avoid backup cron capturing empty install..."
+            echo ""
+            do_restore
+        fi
+    else
+        echo "  No snapshots found — new installation."
+        echo "  Configure Claude, then run --backup to create your first snapshot."
+        echo ""
+    fi
+
+    echo "=== Install complete ==="
+    echo ""
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+for arg in "$@"; do
+    case "$arg" in
+        --install)         MODE="install"   ;;
+        --setup)           MODE="setup"     ;;
+        --backup)          MODE="backup"    ;;
+        --restore)         MODE="restore"   ;;
+        --status)          MODE="status"    ;;
+        --no-auto-restore) NO_AUTO_RESTORE=1 ;;
+        --force)           FORCE=1          ;;
+        --help|-h)         usage; exit 0    ;;
+        --*)               echo "Unknown argument: $arg"; echo ""; usage; exit 1 ;;
+        *)
+            if [ -d "$arg" ]; then
+                SNAPSHOT="$arg"
+            else
+                echo "Unknown argument: $arg"; echo ""; usage; exit 1
+            fi
+            ;;
+    esac
+done
+
+if [ -z "$MODE" ]; then
+    usage
+    exit 1
+fi
+
+case "$MODE" in
+    install) do_install ;;
+    setup)   do_setup   ;;
+    backup)  do_backup  ;;
+    restore) do_restore ;;
+    status)  do_status  ;;
+esac
