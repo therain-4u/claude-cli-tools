@@ -16,6 +16,7 @@
 #   claude-cli-tools --help
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OS="$(uname -s)"
 SNAPSHOT_DIR_ROOT="${CLAUDE_SNAPSHOTS:-$HOME/development/claude/snapshots}"
 CLAUDE_LIVE="$HOME/.claude"
 MAX_SNAPSHOTS=336              # 14 days × 24 hourly runs
@@ -39,7 +40,7 @@ Usage:
 
   claude-cli-tools --setup
       Deploy audit hooks into ~/.claude/settings.json and install an
-      hourly cron job for --backup. Safe to re-run (idempotent).
+      hourly backup job (cron on Linux, launchd on macOS). Safe to re-run (idempotent).
 
   claude-cli-tools --backup
       Trim .jsonl sessions older than 14 days from ~/.claude/projects/,
@@ -192,12 +193,20 @@ do_status() {
     fi
 
     echo ""
-    local cron_line
-    cron_line=$(crontab -l 2>/dev/null | grep "claude-cli-tools --backup")
-    if [ -n "$cron_line" ]; then
-        echo "  Cron:        ✓ hourly backup active"
+    if [ "$OS" = "Darwin" ]; then
+        if launchctl list "com.therain4u.claude-backup" &>/dev/null; then
+            echo "  Launchd:     ✓ hourly backup active"
+        else
+            echo "  Launchd:     not loaded — run --setup to add"
+        fi
     else
-        echo "  Cron:        not installed — run --setup to add"
+        local cron_line
+        cron_line=$(crontab -l 2>/dev/null | grep "claude-cli-tools --backup")
+        if [ -n "$cron_line" ]; then
+            echo "  Cron:        ✓ hourly backup active"
+        else
+            echo "  Cron:        not installed — run --setup to add"
+        fi
     fi
 
     local hook_state
@@ -311,13 +320,51 @@ PYEOF
         echo "  ✓  Audit hooks merged into settings.json"
     fi
 
-    # Hourly cron
-    local cron_entry="0 * * * * $SCRIPT_DIR/claude-cli-tools --backup"
-    if crontab -l 2>/dev/null | grep -q "claude-cli-tools --backup"; then
-        echo "  ✓  Hourly backup cron already installed"
+    # Hourly backup job
+    if [ "$OS" = "Darwin" ]; then
+        local plist_label="com.therain4u.claude-backup"
+        local plist_dir="$HOME/Library/LaunchAgents"
+        local plist_path="$plist_dir/${plist_label}.plist"
+        mkdir -p "$plist_dir"
+        cat > "$plist_path" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${plist_label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${SCRIPT_DIR}/claude-cli-tools</string>
+        <string>--backup</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/tmp/claude-backup.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/claude-backup.log</string>
+</dict>
+</plist>
+EOF
+        if launchctl list "$plist_label" &>/dev/null; then
+            launchctl unload "$plist_path" 2>/dev/null
+            launchctl load "$plist_path"
+            echo "  ✓  Hourly backup launchd agent reloaded"
+        else
+            launchctl load "$plist_path"
+            echo "  ✓  Hourly backup launchd agent installed"
+        fi
     else
-        (crontab -l 2>/dev/null | grep -v "claude-cli-tools --backup"; echo "$cron_entry") | crontab -
-        echo "  ✓  Hourly backup cron installed"
+        local cron_entry="0 * * * * $SCRIPT_DIR/claude-cli-tools --backup"
+        if crontab -l 2>/dev/null | grep -q "claude-cli-tools --backup"; then
+            echo "  ✓  Hourly backup cron already installed"
+        else
+            (crontab -l 2>/dev/null | grep -v "claude-cli-tools --backup"; echo "$cron_entry") | crontab -
+            echo "  ✓  Hourly backup cron installed"
+        fi
     fi
 
     echo ""
@@ -390,8 +437,10 @@ CLEOF
 
     # Ensure ~/.local/bin is in PATH
     if ! echo "$PATH" | grep -q "$HOME/.local/bin"; then
+        local rc_file=".bashrc"
+        [ "$OS" = "Darwin" ] && rc_file=".zshrc"
         echo "  NOTE: Add ~/.local/bin to your PATH (it's not there now)."
-        echo "        Add to ~/.bashrc:  export PATH=\"\$HOME/.local/bin:\$PATH\""
+        echo "        Add to ~/${rc_file}:  export PATH=\"\$HOME/.local/bin:\$PATH\""
     fi
 
     echo ""
