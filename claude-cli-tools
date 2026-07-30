@@ -5,7 +5,12 @@
 # Backs up ~/.claude/ using rsync --link-dest incremental snapshots.
 # Each hourly run creates a dated snapshot directory. Unchanged files are
 # hardlinks to the previous snapshot — zero extra disk space. Snapshots
-# land in ~/development/claude/snapshots/, which restic already covers.
+# land in ~/development/claude/snapshots/, which restic also backs up.
+#
+# Keep SNAPSHOT_EXCLUDES tight. "Zero extra disk space" is true of hardlinks but
+# NOT of restic, whose index scales with path count — an unfiltered snapshot set
+# OOM-killed the fileshare LXC nightly in July 2026. Adding a large subtree here
+# costs backup capacity even when it costs no disk.
 #
 # Usage:
 #   claude-cli-tools --install    [--no-auto-restore]   Install Claude + cl wrapper + setup
@@ -21,6 +26,25 @@ SNAPSHOT_DIR_ROOT="${CLAUDE_SNAPSHOTS:-$HOME/development/claude/snapshots}"
 CLAUDE_LIVE="$HOME/.claude"
 MAX_SNAPSHOTS=336              # 14 days × 24 hourly runs
 CONVERSATION_HISTORY_DAYS=14
+
+# Paths under ~/.claude/ excluded from every snapshot.
+#
+# file-history is Claude Code's rewind buffer — prior versions of files edited
+# during a session. Excluding it does NOT disable rewind: ~/.claude/file-history
+# stays live and untouched. It only stops archiving it hourly.
+#
+# Why it matters: it is ~5,100 of the ~6,000 files in a snapshot (85%). Across
+# MAX_SNAPSHOTS that was ~893,000 paths on the NFS share. --link-dest hardlinks
+# keep that cheap on disk, but restic's index scales with PATH COUNT, not bytes,
+# and it OOM-killed the 1 GiB fileshare LXC nightly from 2026-07-25, taking /srv
+# (including unreproducible sensor data) out of backup entirely.
+# See ~/development/backup/TODO/bug_infra_fileshare-restic-oom.md
+#
+# What is lost: restoring an old snapshot won't rewind file edits from that old
+# session. The files it shadows live in ~/development, which is in git and in
+# restic, so git already answers "what did this look like before" for anything
+# committed. Uncommitted mid-session state is the real gap — accepted knowingly.
+SNAPSHOT_EXCLUDES=(file-history)
 FORCE=0
 NO_AUTO_RESTORE=0
 MODE=""
@@ -99,18 +123,23 @@ snapshot_live_files() {
 # ── Incremental snapshot ──────────────────────────────────────────────────────
 
 create_snapshot() {
-    local ts prev snapshot_dir
+    local ts prev snapshot_dir exclude_args=()
     prev=$(ls -td "$SNAPSHOT_DIR_ROOT"/snapshot-* 2>/dev/null | head -1)
     ts=$(date +%Y%m%dT%H%M%S)
     snapshot_dir="$SNAPSHOT_DIR_ROOT/snapshot-${ts}"
     mkdir -p "$snapshot_dir"
 
+    local ex
+    for ex in "${SNAPSHOT_EXCLUDES[@]}"; do
+        exclude_args+=(--exclude="$ex")
+    done
+
     if [ -n "$prev" ]; then
-        rsync -a --link-dest="$prev" "$CLAUDE_LIVE/" "$snapshot_dir/" 2>/dev/null \
+        rsync -a "${exclude_args[@]}" --link-dest="$prev" "$CLAUDE_LIVE/" "$snapshot_dir/" 2>/dev/null \
             && echo "  Snapshot (incremental)  → snapshot-${ts}" \
             || echo "  WARNING: incremental snapshot failed"
     else
-        rsync -a "$CLAUDE_LIVE/" "$snapshot_dir/" 2>/dev/null \
+        rsync -a "${exclude_args[@]}" "$CLAUDE_LIVE/" "$snapshot_dir/" 2>/dev/null \
             && echo "  Snapshot (full)         → snapshot-${ts}" \
             || echo "  WARNING: snapshot failed"
     fi
