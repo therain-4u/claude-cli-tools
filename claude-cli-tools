@@ -24,7 +24,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OS="$(uname -s)"
 SNAPSHOT_DIR_ROOT="${CLAUDE_SNAPSHOTS:-$HOME/development/claude/snapshots}"
 CLAUDE_LIVE="$HOME/.claude"
-MAX_SNAPSHOTS=336              # 14 days × 24 hourly runs
+# Tiered retention, replacing a flat MAX_SNAPSHOTS=336 (14 days × 24 hourly) on
+# 2026-08-08. The flat count was the dominant cost in the whole backup estate:
+# measured on the NFS share, claude/snapshots was 261,969 of 313,591 files — 84% —
+# so restic's nightly walk was mostly re-indexing 336 rotations of one tree. Hourly
+# for 48 h then daily gives ~62 snapshots for ~54,000 files, an ~80% cut, without
+# losing the granularity that is actually used (rewinding a recent session).
+#
+# Two bands, not one number, because the value of a snapshot decays with age in a
+# way a count cannot express: within two days you want the exact hour, beyond that
+# you want the day. See ~/development/backup/TODO/bug_infra_fileshare-restic-oom.md
+# task 1b.
+SNAPSHOT_HOURLY_HOURS=48       # keep EVERY snapshot newer than this
+SNAPSHOT_DAILY_DAYS=14         # beyond that, keep the newest one per day, this far back
+MAX_LIVE_ARCHIVES=24           # pre-restore live-*.tar.gz tarballs (unrelated to the above)
 CONVERSATION_HISTORY_DAYS=14
 
 # Paths under ~/.claude/ excluded from every snapshot.
@@ -88,7 +101,8 @@ Backup model (rsync --link-dest incremental):
   Each --backup creates SNAPSHOT_DIR_ROOT/snapshot-YYYYMMDDTHHMMSS/
   Unchanged files are hardlinks to the prior snapshot — zero extra space.
   Conversation history older than CONVERSATION_HISTORY_DAYS is trimmed from live
-  before each snapshot. MAX_SNAPSHOTS oldest dirs are deleted automatically.
+  before each snapshot. Snapshots rotate on a tiered policy: every snapshot for
+  SNAPSHOT_HOURLY_HOURS, then one per day back to SNAPSHOT_DAILY_DAYS.
   --restore creates a live-YYYYMMDDTHHMMSS.tar.gz pre-restore safety snapshot.
 EOF
 }
@@ -147,13 +161,73 @@ create_snapshot() {
 
 # ── Snapshot rotation ─────────────────────────────────────────────────────────
 
-rotate_snapshots() {
-    local excess
-    excess=$(ls -td "$SNAPSHOT_DIR_ROOT"/snapshot-* 2>/dev/null | tail -n +$((MAX_SNAPSHOTS + 1)))
-    [ -n "$excess" ] && echo "$excess" | xargs rm -rf \
-        && echo "  Rotated old snapshots (kept $MAX_SNAPSHOTS)"
+# Cutoff timestamp N hours ago, in the snapshot-name format (YYYYMMDDTHHMMSS).
+# Snapshot names are lexicographically ordered by time, so a string compare against
+# this is a valid age test — no per-directory stat, and no dependence on mtime, which
+# --link-dest and NFS both perturb.
+cutoff_stamp() {
+    local hours_ago=$1
+    if [ "$OS" = "Darwin" ]; then
+        date -v-"${hours_ago}"H +%Y%m%dT%H%M%S
+    else
+        date -d "${hours_ago} hours ago" +%Y%m%dT%H%M%S
+    fi
+}
 
-    excess=$(ls -t "$(dirname "$SNAPSHOT_DIR_ROOT")"/live-*.tar.gz 2>/dev/null | tail -n +$((MAX_SNAPSHOTS + 1)))
+# Decide what to KEEP, then delete the rest — rather than computing what to delete.
+# The inverse is what the flat `tail -n +337` did, and it cannot express "one per day":
+# any count-based rule keeps whatever happens to be newest, so a burst of runs silently
+# evicts older days. Selecting keepers makes the retention policy the thing in the code.
+snapshots_to_keep() {
+    local hourly_cutoff daily_cutoff name stamp day last_day=""
+    hourly_cutoff="snapshot-$(cutoff_stamp "$SNAPSHOT_HOURLY_HOURS")"
+    daily_cutoff="snapshot-$(cutoff_stamp $((SNAPSHOT_DAILY_DAYS * 24)))"
+
+    # Newest first, so the first snapshot seen for a given day is that day's keeper.
+    while read -r path; do
+        [ -n "$path" ] || continue
+        name=$(basename "$path")
+
+        # Band 1 — inside the hourly window: keep everything.
+        if [[ "$name" > "$hourly_cutoff" ]]; then
+            echo "$path"
+            continue
+        fi
+
+        # Past the daily window entirely: keep nothing older.
+        [[ "$name" > "$daily_cutoff" ]] || continue
+
+        # Band 2 — one per calendar day. stamp is YYYYMMDDTHHMMSS; day is the date part.
+        stamp=${name#snapshot-}
+        day=${stamp%%T*}
+        if [ "$day" != "$last_day" ]; then
+            echo "$path"
+            last_day="$day"
+        fi
+    done < <(ls -1d "$SNAPSHOT_DIR_ROOT"/snapshot-* 2>/dev/null | sort -r)
+}
+
+rotate_snapshots() {
+    local excess keep all n_keep n_del
+    keep=$(snapshots_to_keep)
+
+    # Refuse to act on an empty keep-set. If cutoff_stamp failed (an unexpected `date`),
+    # every snapshot would fall outside both bands and this would delete the entire
+    # history in one run. A backup rotation must fail closed.
+    if [ -z "$keep" ]; then
+        echo "  ⚠ Rotation skipped — computed an empty keep-set (refusing to delete everything)" >&2
+    else
+        all=$(ls -1d "$SNAPSHOT_DIR_ROOT"/snapshot-* 2>/dev/null)
+        excess=$(comm -23 <(echo "$all" | sort) <(echo "$keep" | sort))
+        if [ -n "$excess" ]; then
+            n_keep=$(echo "$keep" | wc -l | tr -d ' ')
+            n_del=$(echo "$excess" | wc -l | tr -d ' ')
+            echo "$excess" | xargs rm -rf \
+                && echo "  Rotated snapshots (kept $n_keep, removed $n_del — hourly ${SNAPSHOT_HOURLY_HOURS}h, then daily ${SNAPSHOT_DAILY_DAYS}d)"
+        fi
+    fi
+
+    excess=$(ls -t "$(dirname "$SNAPSHOT_DIR_ROOT")"/live-*.tar.gz 2>/dev/null | tail -n +$((MAX_LIVE_ARCHIVES + 1)))
     [ -n "$excess" ] && echo "$excess" | xargs rm -f \
         && echo "  Rotated old pre-restore snapshots"
 }
@@ -210,7 +284,7 @@ do_status() {
         snap_ts=$(basename "$latest_snapshot" | sed 's/snapshot-//')
         snap_count=$(find "$latest_snapshot" -type f 2>/dev/null | wc -l | tr -d ' ')
         echo "  Latest:      ${snap_ts:0:4}-${snap_ts:4:2}-${snap_ts:6:2} ${snap_ts:9:2}:${snap_ts:11:2}  ($snap_count files)"
-        echo "  Count:       $n_snapshots snapshots  (max $MAX_SNAPSHOTS)  ${snap_size:-?} total"
+        echo "  Count:       $n_snapshots snapshots  (hourly ${SNAPSHOT_HOURLY_HOURS}h, then daily ${SNAPSHOT_DAILY_DAYS}d)  ${snap_size:-?} total"
 
         if [ "$live_count" -gt 0 ] && [ "$snap_count" -lt "$((live_count / 2))" ]; then
             echo "  Sync:        BACKUP RECOMMENDED (snapshot ${snap_count} vs live ${live_count} files)"
