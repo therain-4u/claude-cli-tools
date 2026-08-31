@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# pre-commit — refuse a commit on the trunk of a REPLICATED checkout.
+#
+# Created 2026-08-31 by the parallel-work rollout. This repo had NO pre-commit hook and is one of the
+# handful where work actually happens, so a commit on the shared trunk went unremarked.
+#
+# ~/development is Syncthing-replicated with .git included: one working tree, index and HEAD are
+# shared by every concurrent session, and git's own internals replicate between machines. A commit
+# on the trunk here is delivered by whoever pushes next.
+#
+# The guard is SILENT in a worktree, on a feature branch, on a detached HEAD, and outside the
+# replicated root, and it ALLOWS on its own crash — eight sessions share these repos and a guard
+# that fails closed on its own bug stops all of them.
+#
+# Override, deliberately verbose:  ALLOW_TRUNK_COMMIT=1 git commit ...
+#
+# ⚠ THIS FILE LIVES IN .git/hooks AND IS THEREFORE PER-CLONE, NOT TRACKED. It replicates today only
+# because .git is in the Syncthing share — the very thing we are removing. At that cutover every
+# clone needs it installed again; see claude/context_docs/decision_git_out_of_the_file_share.md.
+if [ -x "$HOME/development/.claude/tools/guard-shared-trunk" ]; then
+    "$HOME/development/.claude/tools/guard-shared-trunk" || exit 1
+fi
