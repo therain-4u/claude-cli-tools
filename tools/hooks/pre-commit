@@ -1,22 +1,23 @@
-#!/usr/bin/env bash
-# pre-commit — refuse a commit on the trunk of a REPLICATED checkout.
+# --- shared: refuse a commit on the trunk of a REPLICATED checkout (see the tool's docstring) ---
+# ⛔ THIS BLOCK REFUSES WHEN THE GUARD IS MISSING, and that is the whole point of its shape. It
+# used to be `if [ -x <one absolute path> ]; then ... fi`, so the day the guard moved the test
+# simply came out false and every commit here went through UNGUARDED — no error, no warning,
+# nothing in the output. A control that can vanish silently is not a control.
+# claude-ops TODO/design_architecture_a-subsystem-owns-its-code-and-its-docs.md, step 3.
 #
-# Created 2026-08-31 by the parallel-work rollout. This repo had NO pre-commit hook and is one of the
-# handful where work actually happens, so a commit on the shared trunk went unremarked.
-#
-# ~/development is Syncthing-replicated with .git included: one working tree, index and HEAD are
-# shared by every concurrent session, and git's own internals replicate between machines. A commit
-# on the trunk here is delivered by whoever pushes next.
-#
-# The guard is SILENT in a worktree, on a feature branch, on a detached HEAD, and outside the
-# replicated root, and it ALLOWS on its own crash — eight sessions share these repos and a guard
-# that fails closed on its own bug stops all of them.
-#
-# Override, deliberately verbose:  ALLOW_TRUNK_COMMIT=1 git commit ...
-#
-# ⚠ THIS FILE LIVES IN .git/hooks AND IS THEREFORE PER-CLONE, NOT TRACKED. It replicates today only
-# because .git is in the Syncthing share — the very thing we are removing. At that cutover every
-# clone needs it installed again; see claude/context_docs/decision_git_out_of_the_file_share.md.
-if [ -x "$HOME/development/.claude/tools/guard-shared-trunk" ]; then
-    "$HOME/development/.claude/tools/guard-shared-trunk" || exit 1
+# Two homes are accepted for one release: the guard moved to claude-ops on 2026-09-03 to sit with
+# the docs that explain it, and a repo whose hook has not been updated yet must not break.
+_guard=""
+for _c in "$HOME/development/claude/git-workflow/tools/guard-shared-trunk" \
+          "$HOME/development/.claude/tools/guard-shared-trunk"; do
+    [ -x "$_c" ] && { _guard="$_c"; break; }
+done
+if [ -z "$_guard" ]; then
+    echo "pre-commit: guard-shared-trunk was not found — REFUSING rather than committing" >&2
+    echo "  unguarded. It stands between a session's commit and a shared branch, so its" >&2
+    echo "  absence is a reason to stop, not to continue quietly." >&2
+    echo "  Looked in: ~/development/claude/git-workflow/tools/ then ~/development/.claude/tools/" >&2
+    echo "  If the workspace is genuinely not here (CI, a bare clone): git commit --no-verify" >&2
+    exit 1
 fi
+"$_guard" || exit 1
