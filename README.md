@@ -48,7 +48,7 @@ Hooks log every Bash command Claude attempts and completes to `data/bash-audit.j
 
 ### `--backup`
 
-Trims `.jsonl` session files older than 14 days from `~/.claude/projects/`, then creates an incremental rsync snapshot under `~/development/claude/snapshots/`. Installed as an hourly cron by `--setup`.
+Trims `.jsonl` session files older than 90 days (`CONVERSATION_HISTORY_DAYS`) from `~/.claude/projects/`, then creates an incremental rsync snapshot under `~/development/claude/snapshots/`. Installed as an hourly cron by `--setup`.
 
 Unchanged files are hardlinked to the previous snapshot — zero extra disk space per run.
 
@@ -66,7 +66,7 @@ Shows snapshot count, latest snapshot date, disk usage, and whether `~/.claude/`
 
 All of `~/.claude/` — settings, commands, memory, MCP config, conversation history. Snapshots land in `~/development/claude/snapshots/`, which is a good fit for an existing restic or similar backup covering `~/development/`.
 
-Conversation history (`.jsonl` files) older than 14 days is trimmed from the live directory before each snapshot to keep backup size manageable.
+Conversation history (`.jsonl` files) not changed in 90 days is trimmed from the live directory before each snapshot to keep backup size manageable. This matches Claude Code's own `cleanupPeriodDays`, which ansible sets to 90 on every control node; whichever is shorter is the effective retention, so change both together. (Was 14 days until 2026-10-08.)
 
 ## The `cl` wrapper
 

@@ -38,7 +38,12 @@ CLAUDE_LIVE="$HOME/.claude"
 SNAPSHOT_HOURLY_HOURS=48       # keep EVERY snapshot newer than this
 SNAPSHOT_DAILY_DAYS=14         # beyond that, keep the newest one per day, this far back
 MAX_LIVE_ARCHIVES=24           # pre-restore live-*.tar.gz tarballs (unrelated to the above)
-CONVERSATION_HISTORY_DAYS=14
+# Conversation transcripts (~/.claude/projects/**/*.jsonl) are kept 90 days after
+# their last change. Was 14 until 2026-10-08, when the operator approved 90 ("ok to
+# 90"); Claude Code's own cleanupPeriodDays is set to 90 by ansible
+# roles/tools/claude-code so the two deleters agree. Record:
+# ~/development/claude/TODO/track_architecture_storage-budgets.md
+CONVERSATION_HISTORY_DAYS=90
 
 # Paths under ~/.claude/ excluded from every snapshot.
 #
@@ -79,7 +84,7 @@ Usage:
       hourly backup job (cron on Linux, launchd on macOS). Safe to re-run (idempotent).
 
   claude-cli-tools --backup
-      Trim .jsonl sessions older than 14 days from ~/.claude/projects/,
+      Trim .jsonl sessions older than 90 days from ~/.claude/projects/,
       then create an incremental rsync snapshot under SNAPSHOT_DIR_ROOT.
 
   claude-cli-tools --restore [snapshot-dir] [--force]
