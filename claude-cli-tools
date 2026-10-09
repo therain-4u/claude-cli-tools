@@ -14,7 +14,7 @@
 #
 # Usage:
 #   claude-cli-tools --install    [--no-auto-restore]   Install Claude + setup
-#   claude-cli-tools --setup                            Deploy audit hooks, install hourly cron
+#   claude-cli-tools --setup                            Remove retired hooks, install hourly backup job
 #   claude-cli-tools --backup                           Trim old conversations, create snapshot
 #   claude-cli-tools --restore    [snapshot-dir] [--force]  Restore snapshot → ~/.claude/
 #   claude-cli-tools --status                           Show snapshot info, sync state
@@ -80,8 +80,8 @@ Usage:
       auto-restores the latest one. Pass --no-auto-restore to skip.
 
   claude-cli-tools --setup
-      Deploy audit hooks into ~/.claude/settings.json and install an
-      hourly backup job (cron on Linux, launchd on macOS). Safe to re-run (idempotent).
+      Remove the retired bash audit hooks from ~/.claude/settings.json (if
+      present) and install an hourly backup job (cron on Linux, launchd on macOS). Safe to re-run (idempotent).
 
   claude-cli-tools --backup
       Trim .jsonl sessions older than 90 days from ~/.claude/projects/,
@@ -316,11 +316,8 @@ do_status() {
         fi
     fi
 
-    local hook_state
-    if [ -f "$CLAUDE_LIVE/settings.json" ] && grep -q '"PreToolUse"' "$CLAUDE_LIVE/settings.json" 2>/dev/null; then
-        echo "  Hooks:       ✓ audit hooks installed"
-    else
-        echo "  Hooks:       not installed — run --setup to add"
+    if [ -f "$CLAUDE_LIVE/settings.json" ] && grep -q 'claude-cli-tools/hooks/' "$CLAUDE_LIVE/settings.json" 2>/dev/null; then
+        echo "  Hooks:       ✗ retired audit hooks still in settings.json — run --setup to remove"
     fi
 
     echo ""
@@ -384,47 +381,52 @@ do_setup() {
     mkdir -p "$SNAPSHOT_DIR_ROOT"
     echo "  ✓  Snapshot dir: $SNAPSHOT_DIR_ROOT"
 
-    # Audit hooks
+    # Retired audit hooks. pre-bash.sh and post-bash.sh (bash command logging) were deleted
+    # from this repo on 2026-08-28 (commits 8b4dc4e, 38adad8) because nothing they recorded
+    # had a named use. Deleting the scripts did not delete the settings.json entries that
+    # point at them, and once every checkout pulled the deletion (2026-10-08) every Bash
+    # tool call in every session printed "hook error ... pre-bash.sh: not found". So
+    # --setup now REMOVES any hook whose command points into this repo's hooks/ directory,
+    # and touches nothing else: ansible owns other user-scope hooks (e.g. the SessionStart
+    # dispatch), and the old merge here replaced data['hooks'] wholesale, which deleted them.
+    # Ansible's claude-code role removes the same entries (claude_retired_hook_markers);
+    # this copy covers a host set up by hand from this repo alone.
     local settings="$CLAUDE_LIVE/settings.json"
-    local pre_hook="$SCRIPT_DIR/hooks/pre-bash.sh"
-    local post_hook="$SCRIPT_DIR/hooks/post-bash.sh"
-
-    mkdir -p "$SCRIPT_DIR/data"
-    chmod +x "$pre_hook" "$post_hook" 2>/dev/null
-
-    if [ -f "$settings" ] && grep -q '"PreToolUse"' "$settings" 2>/dev/null; then
-        echo "  ✓  Audit hooks already in settings.json"
-    elif [ ! -f "$settings" ] || [ ! -s "$settings" ]; then
-        mkdir -p "$CLAUDE_LIVE"
-        cat > "$settings" <<EOF
-{
-  "hooks": {
-    "PreToolUse": [
-      {"matcher": "Bash", "hooks": [{"type": "command", "command": "$pre_hook"}]}
-    ],
-    "PostToolUse": [
-      {"matcher": "Bash", "hooks": [{"type": "command", "command": "$post_hook"}]}
-    ]
-  }
-}
-EOF
-        echo "  ✓  Audit hooks written to settings.json"
-    else
-        # Merge hooks into existing settings.json via python3 (safe, no jq dependency)
-        python3 - "$settings" "$pre_hook" "$post_hook" <<'PYEOF'
-import json, sys
-path, pre, post = sys.argv[1], sys.argv[2], sys.argv[3]
-with open(path) as f:
-    data = json.load(f)
-data['hooks'] = {
-    'PreToolUse':  [{'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': pre}]}],
-    'PostToolUse': [{'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': post}]}]
-}
+    if [ -f "$settings" ] && grep -q 'claude-cli-tools/hooks/' "$settings" 2>/dev/null; then
+        if python3 - "$settings" <<'PYEOF'
+import json, shutil, sys, time
+path = sys.argv[1]
+marker = 'claude-cli-tools/hooks/'
+try:
+    with open(path) as f:
+        data = json.load(f)
+except ValueError as e:
+    sys.exit("  ERROR: %s is not valid JSON (%s); left untouched" % (path, e))
+hooks = data.get('hooks')
+if isinstance(hooks, dict):
+    for event in list(hooks):
+        groups = []
+        for group in hooks[event]:
+            kept = [h for h in group.get('hooks', []) if marker not in h.get('command', '')]
+            if kept:
+                group['hooks'] = kept
+                groups.append(group)
+        if groups:
+            hooks[event] = groups
+        else:
+            del hooks[event]
+    if not hooks:
+        del data['hooks']
+shutil.copy2(path, '%s.bak-%s' % (path, time.strftime('%Y%m%dT%H%M%S')))
 with open(path, 'w') as f:
     json.dump(data, f, indent=2)
     f.write('\n')
 PYEOF
-        echo "  ✓  Audit hooks merged into settings.json"
+        then
+            echo "  ✓  Removed retired audit hooks from settings.json (backup kept beside it)"
+        fi
+    else
+        echo "  ✓  No retired audit hooks in settings.json"
     fi
 
     # Hourly backup job

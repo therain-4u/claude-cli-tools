@@ -16,7 +16,7 @@ cd claude-cli-tools
 
 1. Runs the Claude native installer → `~/.local/bin/claude`
 2. Deploys the `cl` tmux wrapper → `~/.local/bin/cl`
-3. Runs `--setup` (audit hooks + hourly backup cron)
+3. Runs `--setup` (hourly backup job; removes the retired audit hooks)
 
 If snapshots already exist in `~/development/claude/snapshots/`, it automatically restores the latest one so the backup cron doesn't capture an empty install. Pass `--no-auto-restore` to skip this.
 
@@ -42,9 +42,9 @@ Installs Claude, deploys `cl`, and runs `--setup`. Safe to re-run on an existing
 
 ### `--setup`
 
-Deploys bash audit hooks into `~/.claude/settings.json` and installs an hourly cron job for `--backup`. Idempotent — safe to re-run.
+Installs an hourly job for `--backup` (cron on Linux, launchd on macOS). Idempotent — safe to re-run.
 
-Hooks log every Bash command Claude attempts and completes to `data/bash-audit.jsonl`.
+It also removes any hook in `~/.claude/settings.json` whose command points into this repo's `hooks/` directory, leaving every other hook and key alone. The bash audit hooks (`pre-bash.sh`, `post-bash.sh`) were retired on 2026-08-28; their settings entries outlived the scripts and made every Bash tool call print a "not found" hook error once the deletion reached each checkout. `--setup` no longer installs any hook.
 
 ### `--backup`
 
@@ -60,7 +60,7 @@ Creates a `live-YYYYMMDDTHHMMSS.tar.gz` pre-restore safety snapshot before overw
 
 ### `--status`
 
-Shows snapshot count, latest snapshot date, disk usage, and whether `~/.claude/` looks in sync with the latest snapshot. Also reports cron and hook state.
+Shows snapshot count, latest snapshot date, disk usage, and whether `~/.claude/` looks in sync with the latest snapshot. Also reports the backup job state, and warns if a retired audit hook is still registered.
 
 ## What gets backed up
 
