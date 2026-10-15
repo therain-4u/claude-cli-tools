@@ -62,7 +62,16 @@ CONVERSATION_HISTORY_DAYS=90
 # session. The files it shadows live in ~/development, which is in git and in
 # restic, so git already answers "what did this look like before" for anything
 # committed. Uncommitted mid-session state is the real gap — accepted knowingly.
-SNAPSHOT_EXCLUDES=(file-history)
+#
+# .credentials.json is the live Claude Code OAuth login (access + refresh token).
+# Excluded since 2026-10-15 with the operator's approval: every hourly snapshot
+# kept a copy of whatever token was live that hour (61 copies, 20 distinct, in the
+# utility/fileshare tree on 2026-10-15), on an NFS share and in the restic repo
+# that backs it. Restore does not need it: --restore is `rsync -a` with no
+# --delete, so an excluded file leaves the live login untouched, and a fresh
+# machine re-authenticates with `claude` itself.
+# Record: ~/development/claude/TODO/bug_claude_credentials-in-snapshots.md
+SNAPSHOT_EXCLUDES=(file-history .credentials.json)
 FORCE=0
 NO_AUTO_RESTORE=0
 MODE=""
@@ -133,7 +142,9 @@ snapshot_live_files() {
     ts=$(date +%Y%m%dT%H%M%S)
     archive="$SNAPSHOT_DIR_ROOT/../live-${ts}.tar.gz"
     mkdir -p "$(dirname "$archive")"
-    tar -czf "$archive" -C "$HOME" .claude 2>/dev/null \
+    # Same credential exclusion as SNAPSHOT_EXCLUDES: restore never overwrites the
+    # live login, so the pre-restore safety copy has no reason to hold it either.
+    tar -czf "$archive" --exclude=.claude/.credentials.json -C "$HOME" .claude 2>/dev/null \
         && echo "  Pre-restore snapshot    → live-${ts}.tar.gz" \
         || echo "  WARNING: pre-restore snapshot failed"
 }
