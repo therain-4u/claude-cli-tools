@@ -18,7 +18,7 @@ cd claude-cli-tools
 2. Deploys the `cl` tmux wrapper → `~/.local/bin/cl`
 3. Runs `--setup` (hourly backup job; removes the retired audit hooks)
 
-If snapshots already exist in `~/development/claude/snapshots/`, it automatically restores the latest one so the backup cron doesn't capture an empty install. Pass `--no-auto-restore` to skip this.
+If snapshots already exist in `~/.local/share/claude-snapshots/` (or `$CLAUDE_SNAPSHOTS`), it automatically restores the latest one so the backup cron doesn't capture an empty install. Pass `--no-auto-restore` to skip this.
 
 Make sure `~/.local/bin` is in your PATH:
 
@@ -48,7 +48,7 @@ It also removes any hook in `~/.claude/settings.json` whose command points into 
 
 ### `--backup`
 
-Trims `.jsonl` session files older than 90 days (`CONVERSATION_HISTORY_DAYS`) from `~/.claude/projects/`, then creates an incremental rsync snapshot under `~/development/claude/snapshots/`. Installed as an hourly cron by `--setup`.
+Trims `.jsonl` session files older than 90 days (`CONVERSATION_HISTORY_DAYS`) from `~/.claude/projects/`, then creates an incremental rsync snapshot under `~/.local/share/claude-snapshots/`. Installed as an hourly cron by `--setup`.
 
 Unchanged files are hardlinked to the previous snapshot — zero extra disk space per run.
 
@@ -64,7 +64,7 @@ Shows snapshot count, latest snapshot date, disk usage, and whether `~/.claude/`
 
 ## What gets backed up
 
-All of `~/.claude/` — settings, commands, memory, MCP config, conversation history. Snapshots land in `~/development/claude/snapshots/`, which is a good fit for an existing restic or similar backup covering `~/development/`.
+All of `~/.claude/` — settings, commands, memory, MCP config, conversation history. Snapshots land in `$XDG_DATA_HOME/claude-snapshots/` (default `~/.local/share/claude-snapshots/`) — outside any git checkout on purpose, so point your backup at that directory. The login (`.credentials.json`) is never copied; a restored `~/.claude/` signs in again.
 
 Conversation history (`.jsonl` files) not changed in 90 days is trimmed from the live directory before each snapshot to keep backup size manageable. This matches Claude Code's own `cleanupPeriodDays`, which ansible sets to 90 on every control node; whichever is shorter is the effective retention, so change both together. (Was 14 days until 2026-10-08.)
 
@@ -87,11 +87,11 @@ cd claude-cli-tools
 ./claude-cli-tools --restore /path/to/existing/snapshot
 ```
 
-Or copy your snapshot directory to `~/development/claude/snapshots/` first and omit `--no-auto-restore` — `--install` will auto-restore the latest one.
+Or copy your snapshot directory to `~/.local/share/claude-snapshots/` first and omit `--no-auto-restore` — `--install` will auto-restore the latest one.
 
 ## Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `CLAUDE_SNAPSHOTS` | `~/development/claude/snapshots` | Override snapshot directory |
+| `CLAUDE_SNAPSHOTS` | `${XDG_DATA_HOME:-~/.local/share}/claude-snapshots` | Override snapshot directory |
 | `CLAUDE_BIN` | `~/.local/bin/claude` | Override Claude binary path (used by `cl`) |

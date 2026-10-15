@@ -5,7 +5,13 @@
 # Backs up ~/.claude/ using rsync --link-dest incremental snapshots.
 # Each hourly run creates a dated snapshot directory. Unchanged files are
 # hardlinks to the previous snapshot — zero extra disk space. Snapshots
-# land in ~/development/claude/snapshots/, which restic also backs up.
+# land in $XDG_DATA_HOME/claude-snapshots (default ~/.local/share/claude-snapshots):
+# a copy of the user's own session history is "user-specific data" in the XDG
+# sense, and it must sit OUTSIDE every git checkout — until 2026-10-15 it lived in
+# ~/development/claude/snapshots, inside the claude-ops checkout, where git walked
+# its 138,758 ignored files on every status (claude-ops
+# TODO/bug_claude_credentials-in-snapshots.md). CLAUDE_SNAPSHOTS overrides it; the
+# ansible roles that schedule --backup set it so the scheduler and this script agree.
 #
 # Keep SNAPSHOT_EXCLUDES tight. "Zero extra disk space" is true of hardlinks but
 # NOT of restic, whose index scales with path count — an unfiltered snapshot set
@@ -22,7 +28,7 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OS="$(uname -s)"
-SNAPSHOT_DIR_ROOT="${CLAUDE_SNAPSHOTS:-$HOME/development/claude/snapshots}"
+SNAPSHOT_DIR_ROOT="${CLAUDE_SNAPSHOTS:-${XDG_DATA_HOME:-$HOME/.local/share}/claude-snapshots}"
 CLAUDE_LIVE="$HOME/.claude"
 # Tiered retention, replacing a flat MAX_SNAPSHOTS=336 (14 days × 24 hourly) on
 # 2026-08-08. The flat count was the dominant cost in the whole backup estate:
@@ -108,7 +114,7 @@ Usage:
   claude-cli-tools --help
 
 Environment:
-  CLAUDE_SNAPSHOTS   Override snapshot directory (default: ~/development/claude/snapshots)
+  CLAUDE_SNAPSHOTS   Override snapshot directory (default: ${XDG_DATA_HOME:-~/.local/share}/claude-snapshots)
 
 Backup model (rsync --link-dest incremental):
   Each --backup creates SNAPSHOT_DIR_ROOT/snapshot-YYYYMMDDTHHMMSS/
@@ -140,7 +146,9 @@ snapshot_live_files() {
     [ -d "$CLAUDE_LIVE" ] || return
     local ts archive
     ts=$(date +%Y%m%dT%H%M%S)
-    archive="$SNAPSHOT_DIR_ROOT/../live-${ts}.tar.gz"
+    # Inside SNAPSHOT_DIR_ROOT, beside the snapshot-* directories: its parent is now
+    # ~/.local/share, which belongs to every program, not to this one.
+    archive="$SNAPSHOT_DIR_ROOT/live-${ts}.tar.gz"
     mkdir -p "$(dirname "$archive")"
     # Same credential exclusion as SNAPSHOT_EXCLUDES: restore never overwrites the
     # live login, so the pre-restore safety copy has no reason to hold it either.
@@ -242,7 +250,7 @@ rotate_snapshots() {
         fi
     fi
 
-    excess=$(ls -t "$(dirname "$SNAPSHOT_DIR_ROOT")"/live-*.tar.gz 2>/dev/null | tail -n +$((MAX_LIVE_ARCHIVES + 1)))
+    excess=$(ls -t "$SNAPSHOT_DIR_ROOT"/live-*.tar.gz 2>/dev/null | tail -n +$((MAX_LIVE_ARCHIVES + 1)))
     [ -n "$excess" ] && echo "$excess" | xargs rm -f \
         && echo "  Rotated old pre-restore snapshots"
 }
