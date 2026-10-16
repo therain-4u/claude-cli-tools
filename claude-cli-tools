@@ -159,9 +159,18 @@ snapshot_live_files() {
 
 # ── Incremental snapshot ──────────────────────────────────────────────────────
 
+# The newest snapshot, chosen by NAME, never by mtime. `rsync -a` gives each snapshot directory the
+# mtime of ~/.claude itself, so every snapshot taken while ~/.claude was unchanged carries one identical
+# mtime, and `ls -t` breaks that tie by name ascending -- it returned the OLDEST of the tie (utility,
+# 2026-10-16: snapshot-20261016T040002 through T110001 all at 03:31:46.030914452). The names are
+# snapshot-YYYYMMDDTHHMMSS, so their sort order is their age order.
+newest_snapshot() {
+    ls -1d "$SNAPSHOT_DIR_ROOT"/snapshot-* 2>/dev/null | sort | tail -1
+}
+
 create_snapshot() {
     local ts prev snapshot_dir exclude_args=()
-    prev=$(ls -td "$SNAPSHOT_DIR_ROOT"/snapshot-* 2>/dev/null | head -1)
+    prev=$(newest_snapshot)
     ts=$(date +%Y%m%dT%H%M%S)
     snapshot_dir="$SNAPSHOT_DIR_ROOT/snapshot-${ts}"
     mkdir -p "$snapshot_dir"
@@ -294,7 +303,7 @@ check_source_safe() {
 do_status() {
     local n_snapshots latest_snapshot snap_size snap_ts live_count snap_count
     n_snapshots=$(ls -d "$SNAPSHOT_DIR_ROOT"/snapshot-* 2>/dev/null | wc -l | tr -d ' ')
-    latest_snapshot=$(ls -td "$SNAPSHOT_DIR_ROOT"/snapshot-* 2>/dev/null | head -1)
+    latest_snapshot=$(newest_snapshot)
     snap_size=$(du -sh "$SNAPSHOT_DIR_ROOT" 2>/dev/null | cut -f1)
     live_count=$(find "$CLAUDE_LIVE" -type f 2>/dev/null | wc -l | tr -d ' ')
 
@@ -362,7 +371,7 @@ do_backup() {
 do_restore() {
     local snap_src
     snap_src="$SNAPSHOT"
-    [ -z "$snap_src" ] && snap_src=$(ls -td "$SNAPSHOT_DIR_ROOT"/snapshot-* 2>/dev/null | head -1)
+    [ -z "$snap_src" ] && snap_src=$(newest_snapshot)
 
     if [ -z "$snap_src" ] || [ ! -d "$snap_src" ]; then
         echo "ERROR: No snapshots found in $SNAPSHOT_DIR_ROOT. Run --backup first." >&2
@@ -524,7 +533,7 @@ do_install() {
 
     # Auto-restore if snapshots exist
     local latest_snap
-    latest_snap=$(ls -td "$SNAPSHOT_DIR_ROOT"/snapshot-* 2>/dev/null | head -1)
+    latest_snap=$(newest_snapshot)
     if [ -n "$latest_snap" ]; then
         if [ "$NO_AUTO_RESTORE" -eq 1 ]; then
             echo "  Snapshots found but --no-auto-restore set — skipping restore."
